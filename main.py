@@ -9,7 +9,7 @@ Sharp gaming-culture overlay — PyQt5
 • Firebase config loaded from file — never in source code
 """
 
-import sys, os, json, threading, time, base64, math
+import sys, os, json, threading, time, base64, math, re, webbrowser
 from datetime import datetime
 from io import BytesIO
 
@@ -498,11 +498,271 @@ class AvatarLabel(QLabel):
         p.drawEllipse(1, 1, self._sz-2, self._sz-2)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GIF Picker — Tenor search
+# ══════════════════════════════════════════════════════════════════════════════
+TENOR_KEY = "AIzaSyB0k5HjfCYIXKFpGe8CnpMExampleKey"  # free Tenor API v2 key
+
+class GifTile(QLabel):
+    clicked = pyqtSignal(str)  # gif url
+
+    def __init__(self, gif_url: str, preview_url: str, parent=None):
+        super().__init__(parent)
+        self._url = gif_url
+        self.setFixedSize(100, 80)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            f"background:{P['bg4']};border-radius:6px;"
+            f"border:1px solid {P['border']};"
+        )
+        self.setText("...")
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        threading.Thread(target=self._load, args=(preview_url,), daemon=True).start()
+
+    def _load(self, url):
+        pm = _load_image_from_url(url, max_w=100)
+        if pm:
+            QTimer.singleShot(0, lambda: self._show(pm))
+
+    def _show(self, pm):
+        self.setPixmap(pm.scaled(100, 80, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+        self.setStyleSheet("border-radius:6px;border:1px solid " + P["border"] + ";")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self._url)
+
+
+class GifPicker(QWidget):
+    gif_selected = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(340, 360)
+        self._build()
+
+    def _build(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8,8,8,8)
+        lay.setSpacing(6)
+
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{P['bg2']};border:1px solid {P['border']};"
+            f"border-radius:14px;}}"
+        )
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(24)
+        shadow.setColor(QColor(0,0,0,180))
+        shadow.setOffset(0,4)
+        card.setGraphicsEffect(shadow)
+        lay.addWidget(card)
+
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(10,10,10,10)
+        inner.setSpacing(8)
+
+        # Header
+        hdr = QHBoxLayout()
+        title = QLabel("GIF")
+        title.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        title.setStyleSheet(f"color:{P['text']};")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        close = QPushButton("✕")
+        close.setFixedSize(20,20)
+        close.setStyleSheet(
+            f"QPushButton{{background:transparent;border:none;color:{P['text2']};border-radius:10px;}}"
+            f"QPushButton:hover{{background:{P['danger']};color:white;}}"
+        )
+        close.clicked.connect(self.close)
+        hdr.addWidget(close)
+        inner.addLayout(hdr)
+
+        # Search box
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search GIFs...")
+        self._search.setFont(QFont("Segoe UI", 9))
+        self._search.setStyleSheet(
+            f"QLineEdit{{background:{P['bg3']};border:1px solid {P['border']};"
+            f"border-radius:8px;color:{P['text']};padding:4px 10px;}}"
+            f"QLineEdit:focus{{border-color:{A()};}}"
+        )
+        self._search.returnPressed.connect(self._doSearch)
+        inner.addWidget(self._search)
+
+        # Grid scroll area
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(
+            f"QScrollArea{{border:none;background:{P['bg2']}}}"
+            f"QScrollBar:vertical{{width:3px;background:transparent}}"
+            f"QScrollBar::handle:vertical{{background:{P['border']};border-radius:2px}}"
+            f"QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0}}"
+        )
+        self._grid_w = QWidget()
+        self._grid_w.setStyleSheet(f"background:{P['bg2']}")
+        self._grid = QHBoxLayout(self._grid_w)
+        self._grid.setContentsMargins(0,0,0,0)
+        self._grid.setSpacing(6)
+        self._grid.addStretch()
+        self._scroll.setWidget(self._grid_w)
+        inner.addWidget(self._scroll)
+
+        # Status
+        self._status = QLabel("Type to search GIFs")
+        self._status.setFont(QFont("Segoe UI", 8))
+        self._status.setStyleSheet(f"color:{P['text2']};")
+        self._status.setAlignment(Qt.AlignCenter)
+        inner.addWidget(self._status)
+
+        # Load trending on open
+        threading.Thread(target=self._fetchTrending, daemon=True).start()
+
+    def _doSearch(self):
+        q = self._search.text().strip()
+        if not q:
+            threading.Thread(target=self._fetchTrending, daemon=True).start()
+        else:
+            threading.Thread(target=self._fetchSearch, args=(q,), daemon=True).start()
+        self._status.setText("Searching...")
+
+    def _fetchTrending(self):
+        results = self._query("https://tenor.googleapis.com/v2/featured?key={key}&limit=12&media_filter=gif,tinygif")
+        QTimer.singleShot(0, lambda: self._showResults(results))
+
+    def _fetchSearch(self, q):
+        import urllib.parse
+        enc = urllib.parse.quote(q)
+        results = self._query(f"https://tenor.googleapis.com/v2/search?q={enc}&key={{key}}&limit=12&media_filter=gif,tinygif")
+        QTimer.singleShot(0, lambda: self._showResults(results))
+
+    def _query(self, url_template):
+        import urllib.request
+        # Use Tenor v2 public demo key
+        key = "AIzaSyAyimkuYQYF1t1mB8Fk7PQFDqkEoolYQdE"
+        url = url_template.replace("{key}", key)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent":"RBXChat/2.0"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read())
+            results = []
+            for item in data.get("results", []):
+                media = item.get("media_formats", {})
+                gif   = media.get("gif",     {}).get("url","")
+                tiny  = media.get("tinygif", {}).get("url","")
+                if gif:
+                    results.append((gif, tiny or gif))
+            return results
+        except Exception as e:
+            print(f"[GIF] {e}")
+            return []
+
+    def _showResults(self, results):
+        # Clear grid
+        while self._grid.count() > 1:
+            item = self._grid.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        if not results:
+            self._status.setText("No results found")
+            return
+
+        self._status.setText(f"{len(results)} GIFs")
+        # Use a flow layout — two rows of tiles
+        col1 = QVBoxLayout()
+        col1.setSpacing(6)
+        col2 = QVBoxLayout()
+        col2.setSpacing(6)
+        for i, (gif_url, preview_url) in enumerate(results):
+            tile = GifTile(gif_url, preview_url)
+            tile.clicked.connect(self._onGifClick)
+            (col1 if i % 2 == 0 else col2).addWidget(tile)
+        col1.addStretch()
+        col2.addStretch()
+        self._grid.insertLayout(0, col1)
+        self._grid.insertLayout(1, col2)
+
+    def _onGifClick(self, url: str):
+        self.gif_selected.emit(url)
+        self.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helpers — link detection, image loading
+# ══════════════════════════════════════════════════════════════════════════════
+_URL_RE = re.compile(r'https?://[^\s]+', re.IGNORECASE)
+_IMG_EXT = ('.png','.jpg','.jpeg','.gif','.webp','.gifv')
+
+def _is_image_url(url: str) -> bool:
+    low = url.lower().split('?')[0]
+    return any(low.endswith(e) for e in _IMG_EXT) or 'tenor.com/view' in low or 'media.tenor' in low
+
+def _make_link_text(text: str) -> str:
+    """Convert URLs in text to HTML links."""
+    def repl(m):
+        url = m.group(0)
+        short = url if len(url) <= 40 else url[:37] + '...'
+        return f'<a href="{url}" style="color:{A()};text-decoration:underline;">{short}</a>'
+    return _URL_RE.sub(repl, text)
+
+def _load_image_from_url(url: str, max_w=220) -> QPixmap:
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent":"RBXChat/2.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = r.read()
+        pm = QPixmap()
+        pm.loadFromData(data)
+        if pm.width() > max_w:
+            pm = pm.scaledToWidth(max_w, Qt.SmoothTransformation)
+        return pm
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Image embed widget
+# ══════════════════════════════════════════════════════════════════════════════
+class ImageEmbed(QLabel):
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self.setFixedSize(220, 80)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            f"background:{P['bg4']};border:1px solid {P['border']};"
+            f"border-radius:8px;color:{P['text2']};font-size:8pt;"
+        )
+        self.setText("Loading image...")
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self):
+        pm = _load_image_from_url(self._url)
+        if pm:
+            QTimer.singleShot(0, lambda: self._show(pm))
+        else:
+            QTimer.singleShot(0, lambda: self.setText("Could not load image"))
+
+    def _show(self, pm: QPixmap):
+        self.setPixmap(pm)
+        self.setFixedSize(pm.width(), pm.height())
+        self.setStyleSheet("background:transparent;border:none;border-radius:8px;")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            webbrowser.open(self._url)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Message bubble
 # ══════════════════════════════════════════════════════════════════════════════
 class MsgBubble(QFrame):
-    right_clicked = pyqtSignal(str, str)  # username, avatar_b64
+    right_clicked = pyqtSignal(str, str)
 
     def __init__(self, data: dict, is_dm=False, parent=None):
         super().__init__(parent)
@@ -525,7 +785,7 @@ class MsgBubble(QFrame):
         row.addWidget(av, 0, Qt.AlignTop)
 
         body = QVBoxLayout()
-        body.setSpacing(2)
+        body.setSpacing(4)
         body.setContentsMargins(0,0,0,0)
 
         # Name + time
@@ -533,9 +793,8 @@ class MsgBubble(QFrame):
         header.setSpacing(7)
         name = QLabel(data.get("username","?"))
         name.setFont(QFont("Segoe UI", 9, QFont.Bold))
-        name.setStyleSheet(f"color: {A()};")
+        name.setStyleSheet(f"color:{A()};")
         header.addWidget(name)
-
         ts = data.get("timestamp","")
         try:
             dt = datetime.fromtimestamp(float(ts)/1000) if isinstance(ts,(int,float)) else datetime.fromisoformat(str(ts))
@@ -543,24 +802,41 @@ class MsgBubble(QFrame):
         except: ts_str = datetime.now().strftime("%H:%M")
         t = QLabel(ts_str)
         t.setFont(QFont("Segoe UI", 7))
-        t.setStyleSheet(f"color: {P['text2']};")
+        t.setStyleSheet(f"color:{P['text2']};")
         header.addWidget(t)
         header.addStretch()
         body.addLayout(header)
 
-        txt = QLabel(data.get("text",""))
-        txt.setFont(QFont("Segoe UI", 9))
-        txt.setWordWrap(True)
-        txt.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        txt.setStyleSheet(
-            f"color: {P['text']}; background: {P['bg3']};"
-            f"border: 1px solid {P['border']};"
-            f"border-radius: 2px 10px 10px 10px;"
-            f"padding: 6px 10px;"
-        )
-        body.addWidget(txt)
+        raw_text = data.get("text","")
+        urls     = _URL_RE.findall(raw_text)
+        img_urls = [u for u in urls if _is_image_url(u)]
+        # If message is ONLY an image URL with no other text, skip text bubble
+        only_img = len(img_urls) == 1 and raw_text.strip() == img_urls[0]
+
+        if not only_img:
+            # Text bubble with clickable links
+            html = _make_link_text(raw_text)
+            txt = QLabel(html)
+            txt.setFont(QFont("Segoe UI", 9))
+            txt.setWordWrap(True)
+            txt.setOpenExternalLinks(True)
+            txt.setTextFormat(Qt.RichText)
+            txt.setTextInteractionFlags(Qt.TextBrowserInteraction)
+            txt.setStyleSheet(
+                f"color:{P['text']};background:{P['bg3']};"
+                f"border:1px solid {P['border']};"
+                f"border-radius:2px 10px 10px 10px;"
+                f"padding:6px 10px;"
+            )
+            body.addWidget(txt)
+
+        # Image embeds
+        for url in img_urls:
+            embed = ImageEmbed(url)
+            body.addWidget(embed)
+
         row.addLayout(body)
-        self.setStyleSheet("background: transparent;")
+        self.setStyleSheet("background:transparent;")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -605,12 +881,25 @@ class ChatWidget(QWidget):
             f"background:{P['bg2']};border-top:1px solid {P['border']};"
         )
         bar_lay = QHBoxLayout(bar)
-        bar_lay.setContentsMargins(10,8,10,8)
-        bar_lay.setSpacing(8)
+        bar_lay.setContentsMargins(8,8,8,8)
+        bar_lay.setSpacing(6)
+
+        # GIF button
+        gif_btn = QPushButton("GIF")
+        gif_btn.setFixedSize(36, 32)
+        gif_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        gif_btn.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        gif_btn.setStyleSheet(
+            f"QPushButton{{background:{P['bg3']};border:1px solid {P['border']};"
+            f"border-radius:8px;color:{P['text2']};}}"
+            f"QPushButton:hover{{border-color:{A()};color:{A()};}}"
+        )
+        gif_btn.clicked.connect(self._openGifPicker)
+        bar_lay.addWidget(gif_btn)
 
         self.inp = QLineEdit()
         self.inp.setPlaceholderText(placeholder)
-        self.inp.setMaxLength(300)
+        self.inp.setMaxLength(500)
         self.inp.setFont(QFont("Segoe UI", 9))
         self.inp.setStyleSheet(
             f"QLineEdit{{background:{P['bg3']};border:1px solid {P['border']};"
@@ -638,6 +927,17 @@ class ChatWidget(QWidget):
         if not t: return
         self.inp.clear()
         self.send_requested.emit(t)
+
+    def _openGifPicker(self):
+        picker = GifPicker(self)
+        picker.gif_selected.connect(self._onGifSelected)
+        # Position above the input bar
+        pos = self.mapToGlobal(self.rect().bottomLeft())
+        picker.move(pos.x(), pos.y() - picker.height() - 60)
+        picker.show()
+
+    def _onGifSelected(self, url: str):
+        self.send_requested.emit(url)
 
     def addMessage(self, data: dict, is_dm=False):
         uid = data.get("_key") or f"{data.get('username')}|{data.get('text')}|{data.get('timestamp','')}"
@@ -1520,8 +1820,8 @@ class RBXChat(QWidget):
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setMinimumSize(340, 420)
-        self.resize(340, 480)
+        self.setMinimumSize(360, 500)
+        self.resize(380, 540)
         s = cfg.load_settings()
         pos = s.get("pos")
         if pos:
@@ -1653,7 +1953,7 @@ class RBXChat(QWidget):
 
     def _buildNav(self, layout):
         nav = QFrame()
-        nav.setFixedHeight(38)
+        nav.setFixedHeight(52)
         nav.setStyleSheet(
             f"background:{P['bg2']};border-bottom:1px solid {P['border']};"
         )
@@ -1663,15 +1963,28 @@ class RBXChat(QWidget):
 
         self._nav_btns = []
         tabs = [("💬","Chat",0),("✉️","DMs",1),("👥","Friends",2),("👤","Profile",3),("⚙️","Settings",4)]
-        for icon, tip, idx in tabs:
-            b = QPushButton(icon)
-            b.setToolTip(tip)
-            b.setFixedHeight(38)
-            b.setFont(QFont("Segoe UI Emoji", 13))
+        for icon, label, idx in tabs:
+            b = QPushButton()
+            b.setFixedHeight(52)
             b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.setToolTip(label)
+            # Stack icon + label vertically inside button
+            b_lay = QVBoxLayout(b)
+            b_lay.setContentsMargins(0, 5, 0, 4)
+            b_lay.setSpacing(1)
+            ico = QLabel(icon)
+            ico.setFont(QFont("Segoe UI Emoji", 12))
+            ico.setAlignment(Qt.AlignCenter)
+            ico.setAttribute(Qt.WA_TransparentForMouseEvents)
+            lbl = QLabel(label)
+            lbl.setFont(QFont("Segoe UI", 7))
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setAttribute(Qt.WA_TransparentForMouseEvents)
+            b_lay.addWidget(ico)
+            b_lay.addWidget(lbl)
             b.clicked.connect(lambda _, i=idx: self._switchTab(i))
             row.addWidget(b)
-            self._nav_btns.append(b)
+            self._nav_btns.append((b, ico, lbl))
 
         layout.addWidget(nav)
         self._switchTab(0)
@@ -1679,13 +1992,19 @@ class RBXChat(QWidget):
     def _switchTab(self, idx):
         self.stack.setCurrentIndex(idx)
         a = A()
-        for i, b in enumerate(self._nav_btns):
+        for i, (b, ico, lbl) in enumerate(self._nav_btns):
             active = (i == idx)
+            bg = "rgba(255,255,255,0.05)" if active else "transparent"
             b.setStyleSheet(
-                f"QPushButton{{background:{'rgba(255,255,255,0.04)' if active else 'transparent'};"
-                f"border:none;color:{a if active else P['text2']};"
-                f"border-bottom:{'2px solid '+a if active else '2px solid transparent'};}}"
-                f"QPushButton:hover{{color:{P['text']};background:{P['bg3']};}}"
+                f"QPushButton{{background:{bg};border:none;"
+                f"border-bottom:{'2px solid '+a if active else '2px solid transparent'};"
+                f"border-radius:0px;}}"
+                f"QPushButton:hover{{background:{P['bg3']};}}"
+            )
+            ico.setStyleSheet(f"color:{a if active else P['text2']};background:transparent;")
+            lbl.setStyleSheet(
+                f"color:{a if active else P['text2']};background:transparent;"
+                f"{'font-weight:bold;' if active else ''}"
             )
         if idx == 2:
             QTimer.singleShot(100, self.friends_panel.refresh)
